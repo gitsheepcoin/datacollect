@@ -1,0 +1,242 @@
+#include <hidef.h>      /* common defines and macros */
+#include "derivative.h"      /* derivative-specific definitions */
+#include "SD.h"
+#include "LCD.h"      
+
+#define LEDCPU PORTK_BIT4
+#define LEDCPU_dir DDRK_BIT4
+#define OK PTIH_PTIH6
+#define OK_dir DDRH_DDRH6
+
+#define  BUS_CLOCK		   32000000	   //总线频率
+#define  OSC_CLOCK		   16000000	   //晶振频率
+
+unsigned long secteraddress=757;//SD卡地址第一个数据物理扇区地址初始值，可以用winhex查看，这里是757扇区，根据实际SD卡内容更改
+
+byte BUFFER[512]=""; 
+
+char *xianshi[18] = {
+"飞翔科技开发板",      //0
+"请插入SD卡",          //1
+"并按下OK键",          //2
+"SD卡写保护",          //3
+"请解除写保护",        //4
+"单片机工作正常",      //5
+"按下OK键继续",        //6
+"SD卡初始化成功",      //7
+"读取引导区成功",      //8
+"读取引导区失败",      //9
+"请重新上电实验",      //10
+"擦除SD卡成功",        //11
+"擦除SD卡失败",        //12
+"写入SD卡成功",        //13
+"写入SD卡失败",        //14
+"数据验证成功",        //15
+"数据验证失败",        //16
+"实验结束"             //17
+};
+
+unsigned int m;
+unsigned int error;
+
+/*************************************************************/
+/*                      初始化锁相环                         */
+/*************************************************************/
+void INIT_PLL(void) 
+{
+    CRGINT = 0;                  //关中断
+    CLKSEL_PLLSEL = 0;           //在未初始化PLL前不使用PLL的输出作为CPU时钟
+    
+  #if(BUS_CLOCK == 40000000) 
+    SYNR = 4;
+  #elif(BUS_CLOCK == 32000000)
+    SYNR = 3;     
+  #elif(BUS_CLOCK == 24000000)
+    SYNR = 2;
+  #endif 
+
+    REFDV = 1;                   //PLLCLK=2×OSCCLK×(SYNR+1)/(REFDV+1)＝64MHz ,fbus=32M
+    PLLCTL_PLLON = 1;            //开PLL
+    PLLCTL_AUTO = 1;             //选取自动模式
+    while (CRGFLG_LOCK == 0);    //等待PLL锁定频率
+    CLKSEL_PLLSEL = 1;           //选择系统时钟由PLL产生
+}
+
+/************************************************************/
+/*                    初始化ECT模块                         */
+/************************************************************/
+void initialize_ect(void){
+  TSCR1_TFFCA = 1;  // 定时器标志位快速清除
+  TSCR1_TEN = 1;    // 定时器使能位. 1=允许定时器正常工作; 0=使主定时器不起作用(包括计数器)
+  TIOS  = 0xff;      //指定所有通道为输出比较方式
+  TCTL1 = 0x00;	    // 后四个通道设置为定时器与输出引脚断开
+  TCTL2 = 0x00;     // 前四个通道设置为定时器与输出引脚断开
+  DLYCT = 0x00;	    // 延迟控制功能禁止
+  ICOVW = 0x00;	    // 对应的寄存器允许被覆盖;  NOVWx = 1, 对应的寄存器不允许覆盖
+  ICSYS = 0x00;	    // 禁止IC及PAC的保持寄存器
+  TIE   = 0x00;     // 禁止所有通道定时中断
+  TSCR2 = 0x07;	    // 预分频系数pr2-pr0:111,,时钟周期为4us,
+  TFLG1 = 0xff;	    // 清除各IC/OC中断标志位
+  TFLG2 = 0xff;     // 清除自由定时器中断标志位
+}
+
+/************************************************************/
+/*                        延时函数                          */
+/************************************************************/
+void delay(void) 
+{
+    unsigned int ii,jj;
+    for(ii=0;ii<50;ii++)
+        for(jj=0;jj<50000;jj++);
+}
+
+/*************************************************************/
+/*                           主函数                          */
+/*************************************************************/
+void main(void) {
+	DisableInterrupts;
+  INIT_PLL();
+  initialize_ect();
+  INIT_PORT();
+  SD_Init();
+  LEDCPU_dir=1;
+  LEDCPU=0;
+  OK_dir=0;
+	EnableInterrupts;
+
+  delay1ms(1000);
+  if(CD==1)           //SD卡没有插入检测
+  {
+      lcd_clear();
+      lcd_string(0,0,xianshi[0]);
+      lcd_string(1,1,xianshi[1]);
+      lcd_string(2,1,xianshi[2]);
+  } 
+  else if(WP==1)     //写保护检测
+  {
+      lcd_clear();
+      lcd_string(0,0,xianshi[0]);
+      lcd_string(1,1,xianshi[3]);
+      lcd_string(2,1,xianshi[4]);
+      lcd_string(3,1,xianshi[2]);
+  } 
+  else             //SD卡正常
+  {
+      lcd_clear();
+      lcd_string(0,0,xianshi[0]);
+      lcd_string(1,1,xianshi[5]);
+      lcd_string(2,1,xianshi[6]);
+  }
+
+  delay1ms(1000);
+  while(OK==1);
+
+
+INIT: 			
+	if(SD_Reset()==0)     //初始化SD卡
+	{ 	  
+    SPI_16M();     
+	}
+	else
+	{
+	  delay1ms(1000);
+	  goto INIT; 
+	}
+	
+  lcd_clear();
+  lcd_string(0,0,xianshi[0]);
+  lcd_string(1,1,xianshi[7]);
+  lcd_string(2,1,xianshi[6]);
+
+  delay1ms(1000);
+  while(OK==1);
+	
+  //读取SD卡引导区数据
+	if(!(read_block(0x00, BUFFER))){
+    lcd_clear();
+    lcd_string(0,0,xianshi[0]);
+    lcd_string(1,1,xianshi[8]);
+    lcd_string(2,1,xianshi[6]);
+	}
+	else
+	{
+    lcd_clear();
+    lcd_string(0,0,xianshi[0]);
+    lcd_string(1,1,xianshi[9]);
+    lcd_string(2,1,xianshi[10]);
+	}
+	
+  delay1ms(1000);
+  while(OK==1); 
+   
+  clear_buffer(BUFFER);       //清空接收缓冲器    
+  if(!(write_block(secteraddress,BUFFER))){
+    lcd_clear();
+    lcd_string(0,0,xianshi[0]);
+    lcd_string(1,1,xianshi[11]);
+    lcd_string(2,1,xianshi[6]);
+	}
+	else
+	{
+    lcd_clear();
+    lcd_string(0,0,xianshi[0]);
+    lcd_string(1,1,xianshi[12]);
+    lcd_string(2,1,xianshi[10]);
+ 	} 
+
+  delay1ms(1000);
+  while(OK==1); 
+
+	for(m=0;m<512;m++)
+	   BUFFER[m]='A';
+  if(!(write_block(secteraddress,BUFFER))){      //写入数据
+    lcd_clear();
+    lcd_string(0,0,xianshi[0]);
+    lcd_string(1,1,xianshi[13]);
+    lcd_string(2,1,xianshi[6]);
+	}
+	else
+	{
+    lcd_clear();
+    lcd_string(0,0,xianshi[0]);
+    lcd_string(1,1,xianshi[14]);
+    lcd_string(2,1,xianshi[10]);
+ 	} 
+ 	
+  delay1ms(1000);
+  while(OK==1); 
+  if(!(read_block(secteraddress, BUFFER))){      //验证数据
+      error=0;
+      for(m=0;m<512;m++)
+      {
+          if(BUFFER[m]!='A')
+              error=1;
+      }
+      if(error==0) 
+      {
+          lcd_clear();
+          lcd_string(0,0,xianshi[0]);
+          lcd_string(1,1,xianshi[15]);
+          lcd_string(2,2,xianshi[17]);
+      } 
+      else
+      {
+          lcd_clear();
+          lcd_string(0,0,xianshi[0]);
+          lcd_string(1,1,xianshi[16]);
+          lcd_string(2,1,xianshi[10]);
+      }
+	}
+	else
+	{
+          lcd_clear();
+          lcd_string(0,0,xianshi[0]);
+          lcd_string(1,1,xianshi[16]);
+          lcd_string(2,1,xianshi[10]);
+	}
+ 	
+ 
+  for(;;) {
+   
+  } 
+}
